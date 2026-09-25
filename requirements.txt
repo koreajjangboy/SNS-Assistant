@@ -1,0 +1,7 @@
+# SNS Assistant 실행에 필요한 패키지 (모두 코드에서 직접 import)
+streamlit>=1.64        # UI (main.py)
+pillow>=12.3           # 이미지 크롭·변환 (image_service.py)
+google-genai>=2.25     # Gemini API (gemini_service.py)
+pydantic>=2.13         # Gemini 응답 스키마 (gemini_service.py)
+httpx>=0.28            # 네트워크 오류 처리 (gemini_service.py)
+python-dotenv>=1.2     # .env 로드 (config.py)

@@ -1,0 +1,20 @@
+# Streamlit 테마 — docs/design-system.md 기준 (main.py, app_prototype.py 공용)
+# 테마로 표현할 수 없는 값(그림자, 버튼 상태, 업로더, 카드)은 main.py 의 CSS 에서 적용한다.
+[theme]
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap"
+baseFontSize = 14
+primaryColor = "#3B82F6"
+redColor = "#EF4444"
+baseRadius = "8px"
+buttonRadius = "8px"
+showWidgetBorder = true
+
+[theme.light]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#6B7280"
+borderColor = "#E5E7EB"
+
+[theme.dark]
+backgroundColor = "#111827"
+textColor = "#6B7280"
