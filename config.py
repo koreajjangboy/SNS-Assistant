@@ -17,6 +17,10 @@ def _env(name: str, default: str = "") -> str:
     return default if not value or value.startswith("your_") else value
 
 
+# ---------- 앱 정보 (브라우저 탭 제목, 링크 공유 미리보기) ----------
+APP_TITLE = "SNS Assistant"
+APP_DESCRIPTION = "이미지와 키워드로 SNS 게시글을 자동으로 작성합니다"
+
 # ---------- Gemini ----------
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
 GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.8-flash")  # gemini-2.5-flash 는 신규 키에서 404

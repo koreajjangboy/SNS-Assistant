@@ -8,7 +8,7 @@ import html
 import logging
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -17,6 +17,7 @@ import streamlit as st
 import config
 import gemini_service
 import image_service
+import page_meta
 from gemini_service import GeminiServiceError, GenerationResult
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -176,7 +177,7 @@ def ds(text: str, style: str) -> None:
 
 
 @contextmanager
-def card(key: str, title: str, subtitle: str | None = None) -> Iterator[None]:
+def card(key: str, title: str, subtitle: str | None = None) -> Generator[None]:
     """Figma `Card + Title` — 제목(Title) + 부제(Text), 헤더–본문 16px."""
     with st.container(border=True, key=f"ds-card-{key}"):
         sub = f'<p class="ds-text">{html.escape(subtitle)}</p>' if subtitle else ""
@@ -189,6 +190,8 @@ def card(key: str, title: str, subtitle: str | None = None) -> Iterator[None]:
 TONE_TIP = ("게시글은 이모지 없이, 정중한 격식체(~습니다)로 10문장 전후의 적절한 분량으로 작성돼요. "
             "'안녕하세요 여러분' 같은 상투적인 인사나 광고 문구도 넣지 않아요.")
 RESULT_NOTE = "이모지 없이 정중한 격식체로 쓴 초안이에요."
+LOADING_MESSAGE = "🚀 AI가 SNS 게시글을 생성 중입니다. 잠시만 기다려주세요..."
+DONE_MESSAGE = "🎉 게시글 생성이 완료되었습니다!"
 
 # ============================================================
 # 이미지
@@ -250,28 +253,26 @@ def render_previews(crops: list[Crop], ratio: config.AspectRatio) -> None:
                 )
 
 
-def generate(crops: list[Crop], keywords: list[str]) -> GenerationResult | None:
-    """게시글을 생성하고 재시도·대체 모델 전환 등 진행 상황을 상태 박스에 표시한다. 실패 시 None."""
-    status = st.status("사진과 키워드를 보고 게시글을 쓰고 있어요…", expanded=True)
+def start_generation() -> None:
+    """버튼 on_click — 다음 실행에서 버튼을 '생성 중' 상태로 바꾸고 생성을 시작하도록 표시한다."""
+    st.session_state["generating"] = True
 
-    def show(message: str) -> None:
-        status.update(label=message)
-        status.caption(message)
 
+def generate(crops: list[Crop], keywords: list[str]) -> tuple[GenerationResult | None, str | None]:
+    """스피너와 진행 안내(재시도·대체 모델 전환)를 보여 주며 게시글을 생성한다. 반환: (결과, 오류 문구)."""
     images = [
         image_service.to_model_jpeg(image_service.load_image(c.data), config.MODEL_IMAGE_MAX_SIDE)
         for c in crops[: config.MODEL_MAX_IMAGES]
     ]
+    loading = st.empty()   # 생성이 끝나면 스피너와 진행 안내를 한 번에 지운다
     try:
-        result = gemini_service.generate_post(images, keywords, on_status=show)
+        with loading.container(), st.spinner(LOADING_MESSAGE, show_time=True):
+            progress = st.empty()
+            return gemini_service.generate_post(images, keywords, on_status=progress.caption), None
     except GeminiServiceError as e:
-        status.update(label="게시글을 만들지 못했어요", state="error", expanded=False)
-        st.error(str(e))
-        return None
-    done = ("게시글이 준비됐어요" if result.model == config.GEMINI_MODEL
-            else f"게시글이 준비됐어요 · 기본 모델이 바빠 대체 모델({result.model})로 썼어요")
-    status.update(label=done, state="complete", expanded=False)
-    return result
+        return None, str(e)
+    finally:
+        loading.empty()
 
 
 def render_result(result: GenerationResult, crops: list[Crop], stale: bool) -> None:
@@ -292,11 +293,12 @@ def render_result(result: GenerationResult, crops: list[Crop], stale: bool) -> N
 
 
 def render() -> None:
-    st.set_page_config(page_title="SNS Assistant", page_icon=":material/photo_camera:", layout="wide")
+    # 첫 Streamlit 명령이어야 한다 — 브라우저 탭 제목·파비콘
+    st.set_page_config(page_title=config.APP_TITLE, page_icon="✨", layout="wide")
     inject_styles()
 
-    st.markdown('<div class="ds-header"><p class="ds-metric">SNS Assistant</p>'
-                '<p class="ds-subtitle">이미지와 키워드로 SNS 게시글을 자동으로 작성합니다</p></div>',
+    st.markdown(f'<div class="ds-header"><p class="ds-metric">{html.escape(config.APP_TITLE)}</p>'
+                f'<p class="ds-subtitle">{html.escape(config.APP_DESCRIPTION)}</p></div>',
                 unsafe_allow_html=True)
     if not config.GEMINI_API_KEY:
         st.warning("GEMINI_API_KEY가 설정되지 않아 게시글을 만들 수 없어요. .env 파일에 키를 넣고 앱을 다시 시작해 주세요.")
@@ -311,13 +313,25 @@ def render() -> None:
     signature = (tuple(f.file_id for f in files), ratio.slug, tuple(keywords))
     st.markdown(f'<div class="ds-tip"><p class="ds-text"><span class="ds-tip-label">Tip</span>'
                 f'{html.escape(TONE_TIP)}</p></div>', unsafe_allow_html=True)
-    if st.button("게시글 생성하기", type="primary", icon=":material/auto_awesome:",
-                 disabled=not crops or not config.GEMINI_API_KEY,
-                 help=None if crops else "사진을 1장 이상 올려 주세요"):
-        result = generate(crops, keywords)
+    # 클릭 즉시 버튼이 '생성 중' 비활성 상태로 바뀌어 눌렸음을 알 수 있고, 중복 요청도 막는다
+    generating = st.session_state.get("generating", False)
+    st.button("게시글 생성 중…" if generating else "게시글 생성하기", key="generate",
+              type="primary", icon=":material/auto_awesome:", on_click=start_generation,
+              disabled=generating or not crops or not config.GEMINI_API_KEY,
+              help=None if crops else "사진을 1장 이상 올려 주세요")
+    if generating:
+        st.session_state["generating"] = False   # 생성 중 입력이 바뀌어 중단돼도 버튼이 다시 활성화되도록 먼저 해제
+        result, error = generate(crops, keywords)
         if result:
-            st.session_state["result"] = result
-            st.session_state["result_signature"] = signature
+            st.session_state.update(result=result, result_signature=signature, notice=DONE_MESSAGE)
+        else:
+            st.session_state["notice_error"] = error
+        st.rerun()   # 버튼을 다시 활성 상태로 그리고 완료/오류 메시지를 표시
+
+    if notice := st.session_state.pop("notice", None):
+        st.success(notice)
+    if error := st.session_state.pop("notice_error", None):
+        st.error(error)
 
     result = st.session_state.get("result")
     if result and crops:
@@ -326,6 +340,7 @@ def render() -> None:
 
 def launch() -> int:
     """`python main.py` 로 실행했을 때 Streamlit 서버를 띄운다."""
+    page_meta.ensure_index_meta(config.APP_TITLE, config.APP_DESCRIPTION)   # 서버 시작 전에 적용
     return subprocess.call([
         sys.executable, "-m", "streamlit", "run", __file__,
         "--server.port", str(config.SERVER_PORT), "--server.address", config.SERVER_ADDRESS,
@@ -336,6 +351,8 @@ if __name__ == "__main__":
     from streamlit import runtime
 
     if runtime.exists():
+        # `streamlit run main.py` 로 직접 실행한 경우 — 첫 실행 때 적용 (프로세스당 1회)
+        page_meta.ensure_index_meta(config.APP_TITLE, config.APP_DESCRIPTION)
         render()
     else:
         sys.exit(launch())
