@@ -5,6 +5,7 @@
     python main.py            # 위 명령과 동일 (VS Code 'Run Python File' 용)
 """
 import html
+import json
 import logging
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 import config
 import gemini_service
@@ -194,6 +196,96 @@ LOADING_MESSAGE = "🚀 AI가 SNS 게시글을 생성 중입니다. 잠시만 �
 DONE_MESSAGE = "🎉 게시글 생성이 완료되었습니다!"
 
 # ============================================================
+# 복사 버튼 — st.markdown 은 스크립트를 실행하지 않으므로 components.html(iframe)로 만든다.
+# iframe 안에서는 페이지 CSS 가 적용되지 않아 Figma Secondary 버튼 스타일을 여기서 다시 정의한다.
+# ============================================================
+COPY_LABEL = "게시글 복사하기"
+COPIED_LABEL = "✅ 복사 완료!"
+COPY_FAILED_LABEL = "복사하지 못했어요. 본문을 직접 선택해 복사해 주세요"
+COPY_FEEDBACK_MS = 2000
+COPY_FRAME_HEIGHT = 52     # 모바일 버튼(44px) + 그림자 여백
+_COPY_ICON = ('<svg viewBox="0 -960 960 960" aria-hidden="true"><path d="M360-240q-33 0-56.5-23.5T280-320v-480q0-33 '
+              '23.5-56.5T360-880h360q33 0 56.5 23.5T800-800v480q0 33-23.5 56.5T720-240H360Zm0-80h360v-480H360v480ZM200-80'
+              'q-33 0-56.5-23.5T120-160v-560h80v560h440v80H200Z"/></svg>')
+_COPY_HTML = """<!doctype html>
+<html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@500&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 2px 3px 6px 1px; background: transparent; }   /* 그림자가 잘리지 않을 만큼만 */
+  button {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px; box-sizing: border-box;
+    min-height: 36px; padding: 8px 16px; border: 1px solid __PRIMARY__; border-radius: 8px;
+    background: transparent; color: __PRIMARY__; font: 500 14px/20px Inter, "Source Sans", sans-serif;
+    box-shadow: __SHADOW_INPUT__; cursor: pointer; -webkit-tap-highlight-color: transparent;
+    transition: box-shadow .15s ease, background-color .15s ease;
+  }
+  button:hover { box-shadow: __SHADOW_CARD__; background: __HOVER_BG__; }
+  button:active { box-shadow: none; }
+  button:focus-visible { outline: 2px solid __PRIMARY__; outline-offset: 2px; }
+  svg { width: 18px; height: 18px; fill: currentColor; flex: none; }
+  button.done svg { display: none; }   /* '✅ 복사 완료!' 와 아이콘이 겹치지 않도록 */
+  /* 좁은 화면(모바일): 터치하기 쉽도록 전체 너비·44px 높이 */
+  @media (max-width: 480px) { button { width: 100%; min-height: 44px; } }
+</style></head>
+<body>
+<button id="copy" type="button">__ICON__<span aria-live="polite">__LABEL__</span></button>
+<script>
+  const text = __TEXT__, labels = __LABELS__;
+  const button = document.getElementById("copy"), label = button.querySelector("span");
+  // http 로 LAN 주소에 접속하면(비보안 컨텍스트) navigator.clipboard 가 없으므로 execCommand 로 대체한다
+  function legacyCopy() {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+    document.body.appendChild(area);
+    area.select();
+    area.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    area.remove();
+    return ok;
+  }
+  let timer;
+  button.addEventListener("click", async () => {
+    let ok;
+    try { await navigator.clipboard.writeText(text); ok = true; } catch { ok = legacyCopy(); }
+    label.textContent = ok ? labels.copied : labels.failed;
+    button.classList.add("done");
+    clearTimeout(timer);
+    timer = setTimeout(() => { label.textContent = labels.idle; button.classList.remove("done"); }, __FEEDBACK_MS__);
+  });
+</script>
+</body></html>"""
+
+
+def post_text(post: gemini_service.SnsPost) -> str:
+    """SNS 에 그대로 붙여 넣을 수 있는 형태 — 본문, 빈 줄, 해시태그."""
+    return f"{post.body}\n\n{' '.join(post.hashtags)}"
+
+
+def copy_button(text: str) -> None:
+    """클릭하면 text 를 클립보드에 복사하고 잠시 '복사 완료' 로 바뀌는 버튼."""
+    light = st.context.theme.type != "dark"
+    replacements = {
+        "__PRIMARY__": TOKENS["primary"],
+        "__SHADOW_INPUT__": TOKENS["shadow-input"],
+        "__SHADOW_CARD__": TOKENS["shadow-card"],
+        "__HOVER_BG__": SURFACE_TOKENS["surface-muted"] if light else "transparent",
+        "__ICON__": _COPY_ICON,
+        "__LABEL__": html.escape(COPY_LABEL),
+        "__FEEDBACK_MS__": str(COPY_FEEDBACK_MS),
+        # JS 문자열로 안전하게 넣는다 ("</script>" 로 스크립트가 끊기지 않도록 "</" 도 이스케이프)
+        "__LABELS__": json.dumps({"idle": COPY_LABEL, "copied": COPIED_LABEL, "failed": COPY_FAILED_LABEL},
+                                 ensure_ascii=False).replace("</", "<\\/"),
+        "__TEXT__": json.dumps(text, ensure_ascii=False).replace("</", "<\\/"),
+    }
+    page = _COPY_HTML
+    for placeholder, value in replacements.items():
+        page = page.replace(placeholder, value)
+    components.html(page, height=COPY_FRAME_HEIGHT)
+
+
+# ============================================================
 # 이미지
 # ============================================================
 @dataclass(frozen=True)
@@ -289,6 +381,7 @@ def render_result(result: GenerationResult, crops: list[Crop], stale: bool) -> N
             ds(post.body, "text")
             tags = "".join(f'<span class="ds-bold">{html.escape(t)}</span>' for t in post.hashtags)
             st.markdown(f'<div class="ds-hashtags">{tags}</div>', unsafe_allow_html=True)
+            copy_button(post_text(post))
             ds(RESULT_NOTE, "label")
 
 
