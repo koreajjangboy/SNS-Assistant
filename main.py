@@ -191,8 +191,8 @@ def card(key: str, title: str, subtitle: str | None = None) -> Generator[None]:
 
 
 # 게시글 작성 규칙 안내 (gemini_service.SYSTEM_INSTRUCTION 의 이모지 금지·격식체 규칙과 맞춘다)
-TONE_TIP = ("게시글은 이모지 없이, 정중한 격식체(~습니다)로 10문장 전후의 적절한 분량으로 작성돼요. "
-            "'안녕하세요 여러분' 같은 상투적인 인사나 광고 문구도 넣지 않아요.")
+TONE_TIP = ("게시글은 이모지 없이 정중한 격식체(~습니다)로 작성돼요. 다녀온 경험은 후기로, "
+            "앞으로 열릴 행사 포스터는 참석한 것처럼 쓰지 않고 안내 글로 써요. 판단이 틀리면 글 유형을 직접 골라 주세요.")
 RESULT_NOTE = "이모지 없이 정중한 격식체로 쓴 초안이에요."
 LOADING_MESSAGE = "🚀 Gemini 모델별로 SNS 게시글을 생성 중입니다. 잠시만 기다려주세요..."
 DONE_MESSAGE = "🎉 게시글 생성이 완료되었습니다!"
@@ -321,7 +321,7 @@ def collect_crops(files, ratio: config.AspectRatio) -> list[Crop]:
 # ============================================================
 # 화면 구성
 # ============================================================
-def render_inputs() -> tuple[list, list[str], config.AspectRatio]:
+def render_inputs() -> tuple[list, list[str], config.AspectRatio, str]:
     left, right = st.columns(2, gap="medium")
     with left, card("upload", "이미지 업로드", "JPG · PNG · WEBP 사진을 여러 장 한 번에 올릴 수 있어요"):
         files = st.file_uploader("이미지 선택", type=list(config.UPLOAD_TYPES),
@@ -329,8 +329,10 @@ def render_inputs() -> tuple[list, list[str], config.AspectRatio]:
     with right, card("options", "키워드 · 비율", "키워드는 쉼표로 구분하고, 올릴 곳에 맞는 비율을 골라 주세요"):
         raw_keywords = st.text_input("키워드", placeholder="아메리카노, 감성 카페, 주말 여유")
         keywords = [k.strip() for k in raw_keywords.split(",") if k.strip()]
+        post_type = st.radio("글 유형", list(gemini_service.POST_TYPES), format_func=gemini_service.POST_TYPES.get,
+                             horizontal=True, help="자동 판단은 사진 속 날짜·문구로 후기인지 행사 안내인지 정해요")
         ratio = st.radio("이미지 비율", config.ASPECT_RATIOS, format_func=lambda r: r.label)
-    return files or [], keywords, ratio
+    return files or [], keywords, ratio, post_type
 
 
 def render_previews(crops: list[Crop], ratio: config.AspectRatio) -> None:
@@ -364,13 +366,13 @@ class Outcome:
     error: str | None = None
 
 
-def run_model(model: str, images: Sequence[bytes], keywords: list[str],
+def run_model(model: str, images: Sequence[bytes], keywords: list[str], post_type: str,
               on_status: Callable[[str], None]) -> Outcome:
     """모델 하나로 생성한다. 모델마다 따로 예외를 잡아, 한 모델이 실패해도(한도 소진·과부하 등) 다른 모델 결과는 보여 준다."""
     try:
         # 비교가 목적이므로 대체 모델로 넘어가지 않는다 (넘어가면 다른 칸과 같은 모델 결과가 나올 수 있음)
         return Outcome(result=gemini_service.generate_post(images, keywords, model=model, fallback_models=(),
-                                                           on_status=on_status))
+                                                           post_type=post_type, on_status=on_status))
     except GeminiServiceError as e:
         return Outcome(error=str(e))
     except Exception:
@@ -378,7 +380,7 @@ def run_model(model: str, images: Sequence[bytes], keywords: list[str],
         return Outcome(error="게시글을 만드는 중 알 수 없는 오류가 발생했어요. 잠시 후 다시 시도해 주세요.")
 
 
-def generate(crops: list[Crop], keywords: list[str]) -> dict[str, Outcome]:
+def generate(crops: list[Crop], keywords: list[str], post_type: str) -> dict[str, Outcome]:
     """config.GEMINI_COMPARE_MODELS 의 모델들로 동시에 게시글을 생성한다. 스피너와 모델별 진행 상황을 보여 준다."""
     images = [
         image_service.to_model_jpeg(image_service.load_image(c.data), config.MODEL_IMAGE_MAX_SIDE)
@@ -391,7 +393,8 @@ def generate(crops: list[Crop], keywords: list[str]) -> dict[str, Outcome]:
     try:
         with loading.container(), st.spinner(LOADING_MESSAGE, show_time=True):
             progress = st.empty()
-            futures = {m: pool.submit(run_model, m, images, keywords, lambda msg, m=m: statuses.__setitem__(m, msg))
+            futures = {m: pool.submit(run_model, m, images, keywords, post_type,
+                                      lambda msg, m=m: statuses.__setitem__(m, msg))
                        for m in models}
             pending = set(futures.values())
             while pending:
@@ -411,7 +414,8 @@ def render_panel(model: str, outcome: Outcome) -> None:
             st.error(outcome.error)
         return
     post = outcome.result.post
-    with card(f"result-{model}", model_title(model), f"{outcome.result.model} · 해시태그 {len(post.hashtags)}개"):
+    with card(f"result-{model}", model_title(model),
+              f"{outcome.result.model} · {post.post_type} 글로 작성 · 해시태그 {len(post.hashtags)}개"):
         ds(post.body, "text")
         tags = "".join(f'<span class="ds-bold">{html.escape(t)}</span>' for t in post.hashtags)
         st.markdown(f'<div class="ds-hashtags">{tags}</div>', unsafe_allow_html=True)
@@ -438,14 +442,14 @@ def render() -> None:
     if not config.GEMINI_API_KEY:
         st.warning("GEMINI_API_KEY가 설정되지 않아 게시글을 만들 수 없어요. .env 파일에 키를 넣고 앱을 다시 시작해 주세요.")
 
-    files, keywords, ratio = render_inputs()
+    files, keywords, ratio, post_type = render_inputs()
     crops = collect_crops(files, ratio)
     if crops:
         render_previews(crops, ratio)
 
     if len(crops) > config.MODEL_MAX_IMAGES:
         ds(f"게시글에는 앞의 {config.MODEL_MAX_IMAGES}장만 반영돼요.", "label")
-    signature = (tuple(f.file_id for f in files), ratio.slug, tuple(keywords))
+    signature = (tuple(f.file_id for f in files), ratio.slug, tuple(keywords), post_type)
     st.markdown(f'<div class="ds-tip"><p class="ds-text"><span class="ds-tip-label">Tip</span>'
                 f'{html.escape(TONE_TIP)}</p></div>', unsafe_allow_html=True)
     # 클릭 즉시 버튼이 '생성 중' 비활성 상태로 바뀌어 눌렸음을 알 수 있고, 중복 요청도 막는다
@@ -456,7 +460,7 @@ def render() -> None:
               help=None if crops else "사진을 1장 이상 올려 주세요")
     if generating:
         st.session_state["generating"] = False   # 생성 중 입력이 바뀌어 중단돼도 버튼이 다시 활성화되도록 먼저 해제
-        outcomes = generate(crops, keywords)
+        outcomes = generate(crops, keywords, post_type)
         st.session_state.update(results=outcomes, result_signature=signature)
         if any(o.result for o in outcomes.values()):
             st.session_state["notice"] = DONE_MESSAGE
