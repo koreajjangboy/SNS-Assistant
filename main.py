@@ -9,7 +9,8 @@ import json
 import logging
 import subprocess
 import sys
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -23,6 +24,7 @@ import page_meta
 from gemini_service import GeminiServiceError, GenerationResult
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # 디자인 토큰 — docs/design-system.md
@@ -192,7 +194,7 @@ def card(key: str, title: str, subtitle: str | None = None) -> Generator[None]:
 TONE_TIP = ("게시글은 이모지 없이, 정중한 격식체(~습니다)로 10문장 전후의 적절한 분량으로 작성돼요. "
             "'안녕하세요 여러분' 같은 상투적인 인사나 광고 문구도 넣지 않아요.")
 RESULT_NOTE = "이모지 없이 정중한 격식체로 쓴 초안이에요."
-LOADING_MESSAGE = "🚀 AI가 SNS 게시글을 생성 중입니다. 잠시만 기다려주세요..."
+LOADING_MESSAGE = "🚀 Gemini 모델별로 SNS 게시글을 생성 중입니다. 잠시만 기다려주세요..."
 DONE_MESSAGE = "🎉 게시글 생성이 완료되었습니다!"
 
 # ============================================================
@@ -350,39 +352,79 @@ def start_generation() -> None:
     st.session_state["generating"] = True
 
 
-def generate(crops: list[Crop], keywords: list[str]) -> tuple[GenerationResult | None, str | None]:
-    """스피너와 진행 안내(재시도·대체 모델 전환)를 보여 주며 게시글을 생성한다. 반환: (결과, 오류 문구)."""
+def model_title(model: str) -> str:
+    """`gemini-3.5-flash-lite` → `Gemini 3.5 Flash Lite`"""
+    return "Gemini " + model.removeprefix("gemini-").replace("-", " ").title()
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """모델 하나의 생성 결과 — result 또는 error 중 하나만 채워진다."""
+    result: GenerationResult | None = None
+    error: str | None = None
+
+
+def run_model(model: str, images: Sequence[bytes], keywords: list[str],
+              on_status: Callable[[str], None]) -> Outcome:
+    """모델 하나로 생성한다. 모델마다 따로 예외를 잡아, 한 모델이 실패해도(한도 소진·과부하 등) 다른 모델 결과는 보여 준다."""
+    try:
+        # 비교가 목적이므로 대체 모델로 넘어가지 않는다 (넘어가면 다른 칸과 같은 모델 결과가 나올 수 있음)
+        return Outcome(result=gemini_service.generate_post(images, keywords, model=model, fallback_models=(),
+                                                           on_status=on_status))
+    except GeminiServiceError as e:
+        return Outcome(error=str(e))
+    except Exception:
+        logger.exception("%s 게시글 생성 중 예상하지 못한 오류", model)
+        return Outcome(error="게시글을 만드는 중 알 수 없는 오류가 발생했어요. 잠시 후 다시 시도해 주세요.")
+
+
+def generate(crops: list[Crop], keywords: list[str]) -> dict[str, Outcome]:
+    """config.GEMINI_COMPARE_MODELS 의 모델들로 동시에 게시글을 생성한다. 스피너와 모델별 진행 상황을 보여 준다."""
     images = [
         image_service.to_model_jpeg(image_service.load_image(c.data), config.MODEL_IMAGE_MAX_SIDE)
         for c in crops[: config.MODEL_MAX_IMAGES]
     ]
+    models = config.GEMINI_COMPARE_MODELS
+    statuses = dict.fromkeys(models, "생성 중…")   # 작업 스레드는 여기에 기록만 하고, 화면 갱신은 메인 스레드에서 한다
     loading = st.empty()   # 생성이 끝나면 스피너와 진행 안내를 한 번에 지운다
+    pool = ThreadPoolExecutor(max_workers=len(models))
     try:
         with loading.container(), st.spinner(LOADING_MESSAGE, show_time=True):
             progress = st.empty()
-            return gemini_service.generate_post(images, keywords, on_status=progress.caption), None
-    except GeminiServiceError as e:
-        return None, str(e)
+            futures = {m: pool.submit(run_model, m, images, keywords, lambda msg, m=m: statuses.__setitem__(m, msg))
+                       for m in models}
+            pending = set(futures.values())
+            while pending:
+                _, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                lines = [f"{model_title(m)} — {'완료' if f.done() else statuses[m]}" for m, f in futures.items()]
+                progress.caption("  \n".join(lines))
+            return {m: f.result() for m, f in futures.items()}
     finally:
+        pool.shutdown(wait=False)   # 생성 중 입력이 바뀌어 중단돼도 남은 응답을 기다리지 않는다
         loading.empty()
 
 
-def render_result(result: GenerationResult, crops: list[Crop], stale: bool) -> None:
-    post = result.post
+def render_panel(model: str, outcome: Outcome) -> None:
+    """모델 하나의 결과 카드 — 본문, 해시태그, 복사 버튼. 실패 시 오류 안내."""
+    if not outcome.result:
+        with card(f"result-{model}", model_title(model), model):
+            st.error(outcome.error)
+        return
+    post = outcome.result.post
+    with card(f"result-{model}", model_title(model), f"{outcome.result.model} · 해시태그 {len(post.hashtags)}개"):
+        ds(post.body, "text")
+        tags = "".join(f'<span class="ds-bold">{html.escape(t)}</span>' for t in post.hashtags)
+        st.markdown(f'<div class="ds-hashtags">{tags}</div>', unsafe_allow_html=True)
+        copy_button(post_text(post))
+        ds(RESULT_NOTE, "label")
+
+
+def render_results(outcomes: dict[str, Outcome], stale: bool) -> None:
     if stale:
         st.info("입력이 바뀌었어요. 바뀐 내용으로 다시 쓰려면 '게시글 생성하기'를 눌러 주세요.")
-    with card("result", "SNS 게시글", f"해시태그 {len(post.hashtags)}개 · 그대로 복사해서 쓰거나 내 말투로 조금 다듬어 올려 보세요"):
-        img_col, text_col = st.columns([1, 2], gap="medium")
-        with img_col:
-            st.image(crops[0].data, width="stretch")
-            if len(crops) > 1:
-                ds(f"외 {len(crops) - 1}장", "label")
-        with text_col:
-            ds(post.body, "text")
-            tags = "".join(f'<span class="ds-bold">{html.escape(t)}</span>' for t in post.hashtags)
-            st.markdown(f'<div class="ds-hashtags">{tags}</div>', unsafe_allow_html=True)
-            copy_button(post_text(post))
-            ds(RESULT_NOTE, "label")
+    for col, (model, outcome) in zip(st.columns(len(outcomes), gap="medium"), outcomes.items()):
+        with col:
+            render_panel(model, outcome)
 
 
 def render() -> None:
@@ -414,21 +456,18 @@ def render() -> None:
               help=None if crops else "사진을 1장 이상 올려 주세요")
     if generating:
         st.session_state["generating"] = False   # 생성 중 입력이 바뀌어 중단돼도 버튼이 다시 활성화되도록 먼저 해제
-        result, error = generate(crops, keywords)
-        if result:
-            st.session_state.update(result=result, result_signature=signature, notice=DONE_MESSAGE)
-        else:
-            st.session_state["notice_error"] = error
-        st.rerun()   # 버튼을 다시 활성 상태로 그리고 완료/오류 메시지를 표시
+        outcomes = generate(crops, keywords)
+        st.session_state.update(results=outcomes, result_signature=signature)
+        if any(o.result for o in outcomes.values()):
+            st.session_state["notice"] = DONE_MESSAGE
+        st.rerun()   # 버튼을 다시 활성 상태로 그리고 완료 메시지를 표시 (모델별 오류는 각 결과 카드에 표시)
 
     if notice := st.session_state.pop("notice", None):
         st.success(notice)
-    if error := st.session_state.pop("notice_error", None):
-        st.error(error)
 
-    result = st.session_state.get("result")
-    if result and crops:
-        render_result(result, crops, stale=st.session_state.get("result_signature") != signature)
+    results = st.session_state.get("results")
+    if results and crops:
+        render_results(results, stale=st.session_state.get("result_signature") != signature)
 
 
 def launch() -> int:

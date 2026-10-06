@@ -29,7 +29,12 @@ GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_FALLBACK_MODELS = tuple(
     m.strip() for m in _env("GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite,gemini-3.6-flash").split(",") if m.strip()
 )
-GEMINI_MAX_RETRIES = 5           # 모델당 재시도 횟수 (첫 호출 제외) — 429 / 5xx / 네트워크 오류
+# 결과 비교 화면에 나란히 보여 줄 모델 (왼쪽부터, 쉼표 구분으로 재정의 가능) — 각 칸은 대체 모델 없이 해당 모델로만 생성
+GEMINI_COMPARE_MODELS = tuple(
+    m.strip() for m in _env("GEMINI_COMPARE_MODELS", "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite").split(",")
+    if m.strip()
+)
+GEMINI_MAX_RETRIES = 5          # 모델당 재시도 횟수 (첫 호출 제외) — 429 / 5xx / 네트워크 오류
 GEMINI_BACKOFF_MAX_SECONDS = 15  # 지수 백오프 대기 상한 (2 → 4 → 8 → 15 → 15초)
 GEMINI_TIMEOUT_SECONDS = 60      # 요청 1회당 제한 시간
 
