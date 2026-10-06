@@ -23,10 +23,11 @@ APP_DESCRIPTION = "이미지와 키워드로 SNS 게시글을 자동으로 작�
 
 # ---------- Gemini ----------
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
-GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.8-flash")  # gemini-2.5-flash 는 신규 키에서 404
+GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.5-flash-lite")
 # 기본 모델이 재시도 후에도 과부하(429/5xx)면 순서대로 호출할 대체 모델 (쉼표 구분으로 재정의 가능)
+# 같은 Lite 등급을 먼저 쓰고, 그래도 안 되면 Flash 로 넘어간다 (모델마다 한도가 따로라 한쪽 소진 시에도 동작)
 GEMINI_FALLBACK_MODELS = tuple(
-    m.strip() for m in _env("GEMINI_FALLBACK_MODELS", "gemini-3.6-flash").split(",") if m.strip()
+    m.strip() for m in _env("GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite,gemini-3.6-flash").split(",") if m.strip()
 )
 GEMINI_MAX_RETRIES = 5           # 모델당 재시도 횟수 (첫 호출 제외) — 429 / 5xx / 네트워크 오류
 GEMINI_BACKOFF_MAX_SECONDS = 15  # 지수 백오프 대기 상한 (2 → 4 → 8 → 15 → 15초)
