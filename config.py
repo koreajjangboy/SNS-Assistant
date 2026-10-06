@@ -32,6 +32,12 @@ GEMINI_MAX_RETRIES = 5           # 모델당 재시도 횟수 (첫 호출 제외
 GEMINI_BACKOFF_MAX_SECONDS = 15  # 지수 백오프 대기 상한 (2 → 4 → 8 → 15 → 15초)
 GEMINI_TIMEOUT_SECONDS = 60      # 요청 1회당 제한 시간
 
+# ---------- OpenAI (ChatGPT) — Gemini 결과와 나란히 비교 ----------
+OPENAI_API_KEY = _env("OPENAI_API_KEY")   # 없으면 ChatGPT 칸에 안내만 표시하고 Gemini 는 그대로 동작
+OPENAI_MODEL_NAME = _env("OPENAI_MODEL_NAME", "gpt-4o-mini")
+OPENAI_MAX_RETRIES = 3           # 429 / 5xx / 연결 오류 시 SDK 자동 재시도 횟수
+OPENAI_TIMEOUT_SECONDS = 60      # 요청 1회당 제한 시간
+
 # ---------- 게시글 ----------
 HASHTAG_COUNT = 5                # 결과 카드에 표시할 해시태그 수
 
