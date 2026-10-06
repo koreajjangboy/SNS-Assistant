@@ -9,8 +9,7 @@ import json
 import logging
 import subprocess
 import sys
-from collections.abc import Callable, Generator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -20,13 +19,10 @@ import streamlit.components.v1 as components
 import config
 import gemini_service
 import image_service
-import openai_service
 import page_meta
 from gemini_service import GeminiServiceError, GenerationResult
-from openai_service import OpenAIServiceError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger(__name__)
 
 # ============================================================
 # 디자인 토큰 — docs/design-system.md
@@ -196,11 +192,8 @@ def card(key: str, title: str, subtitle: str | None = None) -> Generator[None]:
 TONE_TIP = ("게시글은 이모지 없이, 정중한 격식체(~습니다)로 10문장 전후의 적절한 분량으로 작성돼요. "
             "'안녕하세요 여러분' 같은 상투적인 인사나 광고 문구도 넣지 않아요.")
 RESULT_NOTE = "이모지 없이 정중한 격식체로 쓴 초안이에요."
-LOADING_MESSAGE = "🚀 Gemini와 ChatGPT가 SNS 게시글을 생성 중입니다. 잠시만 기다려주세요..."
-WAITING_CHATGPT = "Gemini 게시글이 완성됐어요. ChatGPT 결과를 기다리고 있어요…"
+LOADING_MESSAGE = "🚀 AI가 SNS 게시글을 생성 중입니다. 잠시만 기다려주세요..."
 DONE_MESSAGE = "🎉 게시글 생성이 완료되었습니다!"
-# 결과 비교 영역 — (session key, 카드 제목). 왼쪽 Gemini, 오른쪽 ChatGPT
-RESULT_PANELS = (("gemini", "Gemini 생성 결과"), ("chatgpt", "ChatGPT 생성 결과"))
 
 # ============================================================
 # 복사 버튼 — st.markdown 은 스크립트를 실행하지 않으므로 components.html(iframe)로 만든다.
@@ -357,85 +350,39 @@ def start_generation() -> None:
     st.session_state["generating"] = True
 
 
-@dataclass(frozen=True)
-class Outcome:
-    """모델 하나의 생성 결과 — result / error / skipped 중 하나만 채워진다."""
-    result: GenerationResult | None = None
-    error: str | None = None       # 생성 실패 문구
-    skipped: str | None = None     # API 키 미설정 등으로 호출하지 않은 이유
-
-
-# 두 모델은 각자 try-except 로 감싸 한쪽이 실패해도(한도 초과·키 오류 등) 다른 쪽 결과는 그대로 보여 준다.
-def run_gemini(images: Sequence[bytes], keywords: list[str], on_status: Callable[[str], None]) -> Outcome:
-    if not config.GEMINI_API_KEY:
-        return Outcome(skipped="GEMINI_API_KEY가 설정되지 않아 Gemini 결과는 생략했어요. .env 파일에 키를 넣고 앱을 다시 시작해 주세요.")
-    try:
-        return Outcome(result=gemini_service.generate_post(images, keywords, on_status=on_status))
-    except GeminiServiceError as e:
-        return Outcome(error=str(e))
-    except Exception:
-        logger.exception("Gemini 게시글 생성 중 예상하지 못한 오류")
-        return Outcome(error="Gemini 게시글을 만드는 중 알 수 없는 오류가 발생했어요. 잠시 후 다시 시도해 주세요.")
-
-
-def run_chatgpt(images: Sequence[bytes], keywords: list[str]) -> Outcome:
-    if not config.OPENAI_API_KEY:
-        return Outcome(skipped="OPENAI_API_KEY가 설정되지 않아 ChatGPT 결과는 생략했어요. .env 파일에 키를 넣고 앱을 다시 시작해 주세요.")
-    try:
-        return Outcome(result=openai_service.generate_post(images, keywords))
-    except OpenAIServiceError as e:
-        return Outcome(error=str(e))
-    except Exception:
-        logger.exception("ChatGPT 게시글 생성 중 예상하지 못한 오류")
-        return Outcome(error="ChatGPT 게시글을 만드는 중 알 수 없는 오류가 발생했어요. 잠시 후 다시 시도해 주세요.")
-
-
-def generate(crops: list[Crop], keywords: list[str]) -> dict[str, Outcome]:
-    """스피너와 진행 안내(재시도·대체 모델 전환)를 보여 주며 두 모델로 동시에 게시글을 생성한다."""
+def generate(crops: list[Crop], keywords: list[str]) -> tuple[GenerationResult | None, str | None]:
+    """스피너와 진행 안내(재시도·대체 모델 전환)를 보여 주며 게시글을 생성한다. 반환: (결과, 오류 문구)."""
     images = [
         image_service.to_model_jpeg(image_service.load_image(c.data), config.MODEL_IMAGE_MAX_SIDE)
         for c in crops[: config.MODEL_MAX_IMAGES]
     ]
     loading = st.empty()   # 생성이 끝나면 스피너와 진행 안내를 한 번에 지운다
-    # ChatGPT 는 화면을 건드리지 않으므로 별도 스레드에서, Gemini 는 진행 안내(st.caption) 때문에 메인 스레드에서 실행
-    pool = ThreadPoolExecutor(max_workers=1)
     try:
         with loading.container(), st.spinner(LOADING_MESSAGE, show_time=True):
-            chatgpt = pool.submit(run_chatgpt, images, keywords)
             progress = st.empty()
-            gemini = run_gemini(images, keywords, progress.caption)
-            if not chatgpt.done():
-                progress.caption(WAITING_CHATGPT)
-            return {"gemini": gemini, "chatgpt": chatgpt.result()}
+            return gemini_service.generate_post(images, keywords, on_status=progress.caption), None
+    except GeminiServiceError as e:
+        return None, str(e)
     finally:
-        pool.shutdown(wait=False)   # 생성 중 입력이 바뀌어 중단돼도 ChatGPT 응답을 기다리지 않는다
         loading.empty()
 
 
-def render_panel(key: str, title: str, outcome: Outcome) -> None:
-    """모델 하나의 결과 카드 — 본문, 해시태그, 복사 버튼. 실패·생략 시 안내 문구."""
-    if not outcome.result:
-        with card(f"result-{key}", title):
-            if outcome.skipped:
-                st.info(outcome.skipped)
-            else:
-                st.error(outcome.error)
-        return
-    post = outcome.result.post
-    with card(f"result-{key}", title, f"{outcome.result.model} · 해시태그 {len(post.hashtags)}개"):
-        ds(post.body, "text")
-        tags = "".join(f'<span class="ds-bold">{html.escape(t)}</span>' for t in post.hashtags)
-        st.markdown(f'<div class="ds-hashtags">{tags}</div>', unsafe_allow_html=True)
-        copy_button(post_text(post))
-        ds(RESULT_NOTE, "label")
-
-
-def render_results(outcomes: dict[str, Outcome], stale: bool) -> None:
+def render_result(result: GenerationResult, crops: list[Crop], stale: bool) -> None:
+    post = result.post
     if stale:
         st.info("입력이 바뀌었어요. 바뀐 내용으로 다시 쓰려면 '게시글 생성하기'를 눌러 주세요.")
-    for col, (key, title) in zip(st.columns(2, gap="medium"), RESULT_PANELS):
-        with col:
-            render_panel(key, title, outcomes[key])
+    with card("result", "SNS 게시글", f"해시태그 {len(post.hashtags)}개 · 그대로 복사해서 쓰거나 내 말투로 조금 다듬어 올려 보세요"):
+        img_col, text_col = st.columns([1, 2], gap="medium")
+        with img_col:
+            st.image(crops[0].data, width="stretch")
+            if len(crops) > 1:
+                ds(f"외 {len(crops) - 1}장", "label")
+        with text_col:
+            ds(post.body, "text")
+            tags = "".join(f'<span class="ds-bold">{html.escape(t)}</span>' for t in post.hashtags)
+            st.markdown(f'<div class="ds-hashtags">{tags}</div>', unsafe_allow_html=True)
+            copy_button(post_text(post))
+            ds(RESULT_NOTE, "label")
 
 
 def render() -> None:
@@ -446,10 +393,8 @@ def render() -> None:
     st.markdown(f'<div class="ds-header"><p class="ds-metric">{html.escape(config.APP_TITLE)}</p>'
                 f'<p class="ds-subtitle">{html.escape(config.APP_DESCRIPTION)}</p></div>',
                 unsafe_allow_html=True)
-    any_model = bool(config.GEMINI_API_KEY or config.OPENAI_API_KEY)
-    if not any_model:
-        st.warning("GEMINI_API_KEY와 OPENAI_API_KEY가 모두 설정되지 않아 게시글을 만들 수 없어요. "
-                   ".env 파일에 키를 넣고 앱을 다시 시작해 주세요.")
+    if not config.GEMINI_API_KEY:
+        st.warning("GEMINI_API_KEY가 설정되지 않아 게시글을 만들 수 없어요. .env 파일에 키를 넣고 앱을 다시 시작해 주세요.")
 
     files, keywords, ratio = render_inputs()
     crops = collect_crops(files, ratio)
@@ -465,22 +410,25 @@ def render() -> None:
     generating = st.session_state.get("generating", False)
     st.button("게시글 생성 중…" if generating else "게시글 생성하기", key="generate",
               type="primary", icon=":material/auto_awesome:", on_click=start_generation,
-              disabled=generating or not crops or not any_model,
+              disabled=generating or not crops or not config.GEMINI_API_KEY,
               help=None if crops else "사진을 1장 이상 올려 주세요")
     if generating:
         st.session_state["generating"] = False   # 생성 중 입력이 바뀌어 중단돼도 버튼이 다시 활성화되도록 먼저 해제
-        outcomes = generate(crops, keywords)
-        st.session_state.update(results=outcomes, result_signature=signature)
-        if any(o.result for o in outcomes.values()):
-            st.session_state["notice"] = DONE_MESSAGE
-        st.rerun()   # 버튼을 다시 활성 상태로 그리고 완료 메시지를 표시 (모델별 오류는 각 결과 카드에 표시)
+        result, error = generate(crops, keywords)
+        if result:
+            st.session_state.update(result=result, result_signature=signature, notice=DONE_MESSAGE)
+        else:
+            st.session_state["notice_error"] = error
+        st.rerun()   # 버튼을 다시 활성 상태로 그리고 완료/오류 메시지를 표시
 
     if notice := st.session_state.pop("notice", None):
         st.success(notice)
+    if error := st.session_state.pop("notice_error", None):
+        st.error(error)
 
-    results = st.session_state.get("results")
-    if results and crops:
-        render_results(results, stale=st.session_state.get("result_signature") != signature)
+    result = st.session_state.get("result")
+    if result and crops:
+        render_result(result, crops, stale=st.session_state.get("result_signature") != signature)
 
 
 def launch() -> int:
